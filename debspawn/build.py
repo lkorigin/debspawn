@@ -21,6 +21,7 @@ import os
 import subprocess
 import shutil
 import platform
+from contextlib import contextmanager
 from glob import glob
 from .utils.env import ensure_root, switch_unprivileged, get_owner_uid_gid, get_free_space, get_tree_size
 from .utils.misc import temp_dir, cd, format_filesize, version_noepoch
@@ -248,37 +249,6 @@ def internal_execute_build(osbase, pkg_dir, build_only=None, *,
     return True
 
 
-def print_build_detail(osbase, pkgname, version):
-    print_info('Package: {}'.format(pkgname))
-    print_info('Version: {}'.format(version))
-    print_info('Distribution: {}'.format(osbase.suite))
-    print_info('Architecture: {}'.format(osbase.arch))
-    print_info()
-
-
-def _read_source_package_details():
-    out, err, ret = safe_run(['dpkg-parsechangelog'])
-    if ret != 0:
-        raise Exception('Running dpkg-parsechangelog failed: {}{}'.format(out, err))
-
-    pkg_sourcename = None
-    pkg_version = None
-    for line in out.split('\n'):
-        if line.startswith('Source: '):
-            pkg_sourcename = line[8:].strip()
-        elif line.startswith('Version: '):
-            pkg_version = line[9:].strip()
-
-    if not pkg_sourcename or not pkg_version:
-        print_error('Unable to determine source package name or source package version. Can not continue.')
-        return None, None, None
-
-    pkg_version_dsc = version_noepoch(pkg_version)
-    dsc_fname = '{}_{}.dsc'.format(pkg_sourcename, pkg_version_dsc)
-
-    return pkg_sourcename, pkg_version, dsc_fname
-
-
 def _get_build_flags(build_only=None, include_orig=False, maintainer=None, extra_flags=[]):
     import shlex
     buildflags = []
@@ -340,170 +310,171 @@ def _print_system_info():
     print_info('debspawn {version} on {host} at {time}'.format(version=__version__, host=platform.node(), time=current_time_string()))
 
 
-def build_from_directory(osbase, pkg_dir, *,
-                         sign=False, build_only=None, include_orig=False, maintainer=None,
-                         clean_source=False, qa_lintian=False, interact=False, log_build=True, extra_dpkg_flags=[]):
-    ensure_root()
-    osbase.ensure_exists()
+class SourcePackage:
+    def __init__(self):
+        out, err, ret = safe_run(['dpkg-parsechangelog'])
+        if ret != 0:
+            raise Exception('Running dpkg-parsechangelog failed: {}{}'.format(out, err))
 
-    if interact and log_build:
-        print_warn('Build log and interactive mode can not be enabled at the same time. Disabling build log.')
-        print()
-        log_build = False
+        self.source = None
+        self.version = None
+        for line in out.split('\n'):
+            if line.startswith('Source: '):
+                self.source = line[8:].strip()
+            elif line.startswith('Version: '):
+                self.version = line[9:].strip()
 
-    # capture console output if we should log the build
-    if log_build:
-        capture_console_output()
+        if not self.source or not self.version:
+            raise Exception('Unable to determine source package name or source package version. Can not continue.')
 
-    if not pkg_dir:
-        pkg_dir = os.getcwd()
-    pkg_dir = os.path.abspath(pkg_dir)
+        self.dsc = '{}_{}.dsc'.format(self.source, version_noepoch(self.version))
 
-    r, buildflags = _get_build_flags(build_only, include_orig, maintainer, extra_dpkg_flags)
-    if not r:
-        return False
+    def print_build_detail(self, osbase):
+        print_header('Package build')
+        print_info('Package: {}'.format(self.source))
+        print_info('Version: {}'.format(self.version))
+        print_info('Distribution: {}'.format(osbase.suite))
+        print_info('Architecture: {}'.format(osbase.arch))
+        print_info()
 
-    _print_system_info()
-    print_header('Package build (from directory)')
 
-    print_section('Creating source package')
-    with cd(pkg_dir):
-        with switch_unprivileged():
-            deb_files_fname = os.path.join(pkg_dir, 'debian', 'files')
-            if os.path.isfile(deb_files_fname):
-                deb_files_fname = None  # the file already existed, we don't need to clean it up later
+class Build:
+    def __init__(self, options, osbase):
+        if not options.target:
+            options.target = os.getcwd()
+            if os.path.isdir(options.suite):
+                raise Exception(
+                    'A directory is given as parameter, but you are missing a suite parameter to build for.')
 
-            pkg_sourcename, pkg_version, dsc_fname = _read_source_package_details()
-            if not pkg_sourcename:
-                return False
+        ensure_root()
+        osbase.ensure_exists()
 
-            cmd = ['dpkg-buildpackage', '-S', '--no-sign']
-            # d/rules clean requires build dependencies installed if run on the host
-            # we avoid that by default, unless explicitly requested
-            if not clean_source:
-                cmd.append('-nc')
+        # override globally configured output directory with
+        # a custom one defined on the CLI
+        if options.results_dir:
+            osbase.results_dir = options.results_dir
 
-            proc = subprocess.run(cmd)
-            if proc.returncode != 0:
-                return False
+        if options.interact and not options.no_buildlog:
+            print_warn('Build log and interactive mode can not be enabled at the same time. Disabling build log.')
+            print()
+            options.no_buildlog = True
 
-            # remove d/files file that was created when generating the source package.
-            # we only clean up the file if it didn't exist prior to us running the command.
-            if deb_files_fname:
-                try:
-                    os.remove(deb_files_fname)
-                except OSError:
-                    pass
+        buildflags = []
+        if options.buildflags:
+            buildflags = options.buildflags.split(';')
 
-    print_header('Package build')
-    print_build_detail(osbase, pkg_sourcename, pkg_version)
-
-    with temp_dir(pkg_sourcename) as pkg_tmp_dir:
-        with cd(pkg_tmp_dir):
-            cmd = ['dpkg-source',
-                   '-x', os.path.join(pkg_dir, '..', dsc_fname)]
-            proc = subprocess.run(cmd)
-            if proc.returncode != 0:
-                return False
-
-        ret = internal_execute_build(osbase,
-                                     pkg_tmp_dir,
-                                     build_only,
-                                     qa_lintian=qa_lintian,
-                                     interact=interact,
-                                     source_pkg_dir=pkg_dir,
-                                     buildflags=buildflags)
-        if not ret:
-            return False
-
-        # copy build results
-        _retrieve_artifacts(osbase, pkg_tmp_dir)
-
-    # save buildlog, if we generated one
-    log_fname = os.path.join(osbase.results_dir, '{}_{}_{}.buildlog'.format(pkg_sourcename, version_noepoch(pkg_version), osbase.arch))
-    save_captured_console_output(log_fname)
-
-    # sign the resulting package
-    if sign:
-        r = _sign_result(osbase.results_dir, pkg_sourcename, pkg_version, osbase.arch)
+        r, buildflags = _get_build_flags(options.build_only, options.include_orig, options.maintainer, buildflags)
         if not r:
             return False
 
-    print_info('Done.')
+        self.options = options
+        self.osbase = osbase
+        self.buildflags = buildflags
 
-    return True
+    @contextmanager
+    def cd_target(self):
+        target = os.path.abspath(self.options.target)
+        with cd(target), switch_unprivileged():
+            yield target
 
+    def build_source_package(self, target):
+        print_section('Creating source package')
 
-def build_from_dsc(osbase, dsc_fname, *,
-                   sign=False, build_only=None, include_orig=False, maintainer=None,
-                   qa_lintian=False, interact=False, log_build=True, extra_dpkg_flags=[]):
-    ensure_root()
-    osbase.ensure_exists()
+        pkg = SourcePackage()
 
-    if interact and log_build:
-        print_warn('Build log and interactive mode can not be enabled at the same time. Disabling build log.')
-        print()
-        log_build = False
+        deb_files_fname = os.path.join(target, 'debian', 'files')
+        if os.path.isfile(deb_files_fname):
+            deb_files_fname = None  # the file already existed, we don't need to clean it up later
 
-    # capture console output if we should log the build
-    if log_build:
-        capture_console_output()
+        cmd = ['dpkg-buildpackage', '-S', '--no-sign']
+        # d/rules clean requires build dependencies installed if run on the host
+        # we avoid that by default, unless explicitly requested
+        if not self.options.clean_source:
+            cmd.append('-nc')
 
-    r, buildflags = _get_build_flags(build_only, include_orig, maintainer, extra_dpkg_flags)
-    if not r:
-        return False
+        proc = subprocess.run(cmd)
+        if proc.returncode != 0:
+            raise Exception("Failed to run {}".format(cmd))
 
-    _print_system_info()
+        # remove d/files file that was created when generating the source package.
+        # we only clean up the file if it didn't exist prior to us running the command.
+        if deb_files_fname:
+            try:
+                os.remove(deb_files_fname)
+            except OSError:
+                pass
 
-    dsc_fname = os.path.abspath(os.path.normpath(dsc_fname))
-    tmp_prefix = os.path.basename(dsc_fname).replace('.dsc', '').replace(' ', '-')
-    with temp_dir(tmp_prefix) as pkg_tmp_dir:
-        with cd(pkg_tmp_dir):
-            cmd = ['dpkg-source',
-                   '-x', dsc_fname]
-            proc = subprocess.run(cmd)
-            if proc.returncode != 0:
+        return pkg
+
+    def extract_source_package(self, dsc_path):
+        cmd = ['dpkg-source', '-x', dsc_path]
+        proc = subprocess.run(cmd)
+        if proc.returncode != 0:
+            raise Exception('Failed to extract source package from {}'.format(dsc_path))
+
+        pkg_srcdir = None
+        for f in glob('./*'):
+            if os.path.isdir(f):
+                pkg_srcdir = f
+                break
+        if not pkg_srcdir:
+            raise Exception('Unable to find source directory of extracted package.')
+
+        with cd(pkg_srcdir):
+            return SourcePackage()
+
+    def run(self):
+        # capture console output if we should log the build
+        if not self.options.no_buildlog:
+            capture_console_output()
+
+        _print_system_info()
+
+        if os.path.isdir(self.options.target):
+            print_header('Package build (from directory)')
+            with self.cd_target() as target:
+                source_pkg_dir = target
+                pkg = self.build_source_package(target)
+                dsc_path = os.path.join(target, '..', pkg.dsc)
+        else:
+            print_header('Package build (from dsc)')
+            source_pkg_dir = None
+            dsc_path = self.options.target
+
+        dsc_path = os.path.abspath(os.path.normpath(dsc_path))
+        tmp_prefix = os.path.basename(dsc_path).replace('.dsc', '').replace(' ', '-')
+        with temp_dir(tmp_prefix) as pkg_tmp_dir, cd(pkg_tmp_dir):
+            pkg = self.extract_source_package(dsc_path)
+            pkg.print_build_detail(self.osbase)
+
+            ret = internal_execute_build(self.osbase,
+                                         pkg_tmp_dir,
+                                         self.options.build_only,
+                                         qa_lintian=self.options.lintian,
+                                         interact=self.options.interact,
+                                         source_pkg_dir=source_pkg_dir,
+                                         buildflags=self.buildflags)
+
+            # save buildlog, if we generated one
+            log_fname = os.path.join(self.osbase.results_dir,
+                                     '{}_{}_{}.buildlog'.format(
+                                         pkg.source,
+                                         version_noepoch(pkg.version),
+                                         self.osbase.arch))
+            save_captured_console_output(log_fname)
+
+            if not ret:
                 return False
 
-            pkg_srcdir = None
-            for f in glob('./*'):
-                if os.path.isdir(f):
-                    pkg_srcdir = f
-                    break
-            if not pkg_srcdir:
-                print_error('Unable to find source directory of extracted package.')
+            # copy build results
+            _retrieve_artifacts(self.osbase, pkg_tmp_dir)
+
+        # sign the resulting package
+        if self.options.sign:
+            r = _sign_result(self.osbase.results_dir, pkg.source, pkg.version, self.osbase.arch)
+            if not r:
                 return False
 
-            with cd(pkg_srcdir):
-                pkg_sourcename, pkg_version, dsc_fname = _read_source_package_details()
-                if not pkg_sourcename:
-                    return False
+        print_info('Done.')
 
-            print_header('Package build')
-            print_build_detail(osbase, pkg_sourcename, pkg_version)
-
-        ret = internal_execute_build(osbase,
-                                     pkg_tmp_dir,
-                                     build_only,
-                                     qa_lintian=qa_lintian,
-                                     interact=interact,
-                                     buildflags=buildflags)
-        if not ret:
-            return False
-
-        # copy build results
-        _retrieve_artifacts(osbase, pkg_tmp_dir)
-
-    # save buildlog, if we generated one
-    log_fname = os.path.join(osbase.results_dir, '{}_{}_{}.buildlog'.format(pkg_sourcename, version_noepoch(pkg_version), osbase.arch))
-    save_captured_console_output(log_fname)
-
-    # sign the resulting package
-    if sign:
-        r = _sign_result(osbase.results_dir, pkg_sourcename, pkg_version, osbase.arch)
-        if not r:
-            return False
-
-    print_info('Done.')
-
-    return True
+        return True

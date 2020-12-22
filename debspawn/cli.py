@@ -139,7 +139,7 @@ def command_list(options):
 def command_build(options):
     ''' Build a package in a new volatile container '''
 
-    from .build import build_from_directory, build_from_dsc
+    from .build import Build
 
     check_print_version(options)
     if not options.suite:
@@ -148,44 +148,7 @@ def command_build(options):
     gconf = init_config(options)
     osbase = OSBase(gconf, options.suite, options.arch, options.variant)
 
-    buildflags = []
-    if options.buildflags:
-        buildflags = options.buildflags.split(';')
-
-    if not options.target and os.path.isdir(options.suite):
-        print('A directory is given as parameter, but you are missing a suite parameter to build for.')
-        print('Can not continue.')
-        sys.exit(1)
-
-    # override globally configured output directory with
-    # a custom one defined on the CLI
-    if options.results_dir:
-        osbase.results_dir = options.results_dir
-
-    if not options.target or os.path.isdir(options.target):
-        r = build_from_directory(osbase,
-                                 options.target,
-                                 sign=options.sign,
-                                 build_only=options.build_only,
-                                 include_orig=options.include_orig,
-                                 maintainer=options.maintainer,
-                                 clean_source=options.clean_source,
-                                 qa_lintian=options.lintian,
-                                 interact=options.interact,
-                                 log_build=not options.no_buildlog,
-                                 extra_dpkg_flags=buildflags)
-    else:
-        r = build_from_dsc(osbase,
-                           options.target,
-                           sign=options.sign,
-                           build_only=options.build_only,
-                           include_orig=options.include_orig,
-                           maintainer=options.maintainer,
-                           qa_lintian=options.lintian,
-                           interact=options.interact,
-                           log_build=not options.no_buildlog,
-                           extra_dpkg_flags=buildflags)
-    if not r:
+    if not Build(options, osbase).run():
         sys.exit(2)
 
 
